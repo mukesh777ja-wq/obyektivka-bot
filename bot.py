@@ -42,7 +42,13 @@ class Form(StatesGroup):
 
 def no_kb():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="YO'Q")]],
+        keyboard=[[KeyboardButton(text="Yo'q")]],
+        resize_keyboard=True
+    )
+
+def create_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="OBYEKTIVKA YARATISH")]],
         resize_keyboard=True
     )
 
@@ -246,7 +252,7 @@ async def birth_place(message: Message, state: FSMContext):
 async def nationality(message: Message, state: FSMContext):
     await state.update_data(nationality=message.text.strip())
     await state.set_state(Form.party)
-    await message.answer("Partiyaviyligingizni kiriting yoki YO‘Q bosing:", reply_markup=no_kb())
+    await message.answer("Partiyaviyligingizni kiriting yoki Yo'q bosing:", reply_markup=no_kb())
 
 @dp.message(Form.party)
 async def party(message: Message, state: FSMContext):
@@ -270,25 +276,25 @@ async def graduated(message: Message, state: FSMContext):
 async def specialty(message: Message, state: FSMContext):
     await state.update_data(specialty=message.text.strip())
     await state.set_state(Form.degree)
-    await message.answer("Ilmiy darajangizni kiriting yoki YO‘Q bosing:")
+    await message.answer("Ilmiy darajangizni kiriting yoki Yo'q bosing:")
 
 @dp.message(Form.degree)
 async def degree(message: Message, state: FSMContext):
     await state.update_data(degree=message.text.strip())
     await state.set_state(Form.languages)
-    await message.answer("Qaysi chet tillarini bilasiz? yoki YO‘Q bosing:")
+    await message.answer("Qaysi chet tillarini bilasiz? yoki Yo'q bosing:")
 
 @dp.message(Form.languages)
 async def languages(message: Message, state: FSMContext):
     await state.update_data(languages=message.text.strip())
     await state.set_state(Form.awards)
-    await message.answer("Davlat mukofotlari bilan taqdirlanganmisiz? Qaysi? yoki YO‘Q:")
+    await message.answer("Davlat mukofotlari bilan taqdirlanganmisiz? Qaysi? yoki Yo'q:")
 
 @dp.message(Form.awards)
 async def awards(message: Message, state: FSMContext):
     await state.update_data(awards=message.text.strip())
     await state.set_state(Form.elected)
-    await message.answer("Saylanadigan organlarda deputat yoki a’zo bo‘lganmisiz? yoki YO‘Q:")
+    await message.answer("Saylanadigan organlarda deputat yoki a’zo bo‘lganmisiz? yoki Yo'q:")
 
 @dp.message(Form.elected)
 async def elected(message: Message, state: FSMContext):
@@ -297,21 +303,21 @@ async def elected(message: Message, state: FSMContext):
     await message.answer(
         "Mehnat faoliyatingizni kiriting.\n"
         "Har bir ish joyini alohida yuboring.\n"
-        "Tugatish uchun YO‘Q bosing."
+        "Tugatish uchun Yo'q bosing."
     )
 
 @dp.message(Form.work)
 async def work(message: Message, state: FSMContext):
     text = message.text.strip()
     data = await state.get_data()
-    if text.upper() in ("YO'Q", "YO‘Q"):
+    if text.upper() in ("YO'Q", "Yo'q"):
         await state.set_state(Form.photo)
         await message.answer("3x4 rasmingizni foto sifatida yuboring:")
         return
     arr = data.get("work", [])
     arr.append(text)
     await state.update_data(work=arr)
-    await message.answer("Keyingi ish joyini kiriting yoki YO‘Q bosing.")
+    await message.answer("Keyingi ish joyini kiriting yoki Yo'q bosing.")
 
 @dp.message(Form.photo, F.photo)
 async def photo(message: Message, state: FSMContext):
@@ -323,7 +329,8 @@ async def photo(message: Message, state: FSMContext):
     await message.answer(
         "Qarindosh ma’lumotlarini quyidagi ko‘rinishda yuboring:\n"
         "Ota | F.I.Sh. | 1970-yil, joyi | Ish joyi va lavozimi | Turar joyi\n\n"
-        "Barcha qarindoshlarni kiritib bo‘lgach: TAYYORLASH deb yozing."
+        "Barcha qarindoshlarni kiritib bo‘lgach, pastdagi tugmani bosing.",
+        reply_markup=create_kb()
     )
 
 @dp.message(Form.photo)
@@ -333,7 +340,7 @@ async def photo_wrong(message: Message, state: FSMContext):
 @dp.message(Form.relative)
 async def relative(message: Message, state: FSMContext):
     text = message.text.strip()
-    if text.upper() == "TAYYORLASH":
+    if text == "OBYEKTIVKA YARATISH":
         data = await state.get_data()
         filename = OUT / f"Malumotnoma_{message.from_user.id}.docx"
         make_doc(data, filename)
@@ -352,7 +359,7 @@ async def relative(message: Message, state: FSMContext):
     relatives = data.get("relatives", [])
     relatives.append(parts)
     await state.update_data(relatives=relatives)
-    await message.answer("Qabul qilindi. Keyingi qarindoshni kiriting yoki TAYYORLASH deb yozing.")
+    await message.answer("Qabul qilindi. Keyingi qarindoshni kiriting yoki pastdagi tugmani bosing.", reply_markup=create_kb())
 
 async def health(request):
     return web.Response(text="OK")
