@@ -100,11 +100,9 @@ def set_photo_border(cell):
         el.set(qn("w:color"), "000000")
 
 def add_photo_to_cell(cell, photo_path):
-    # Put the 3x4 photo directly into the template photo cell.
-    # This avoids the nested table that caused the photo to be clipped/off-page.
+    """Insert a floating 3x4 photo, equivalent to Word's 'Перед текстом'."""
     for p in list(cell.paragraphs):
         clear_paragraph(p)
-    # Remove any nested tables left in the template cell.
     for tbl in list(cell.tables):
         tbl._element.getparent().remove(tbl._element)
 
@@ -115,8 +113,70 @@ def add_photo_to_cell(cell, photo_path):
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(0)
     p.paragraph_format.line_spacing = 1.0
+
     run = p.add_run()
     run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
+
+    # Convert the inline picture to a floating drawing.  This is the Word
+    # layout mode "Перед текстом" (In Front of Text), so the picture can be
+    # positioned independently instead of being clipped by the table column.
+    inline = run._r.xpath('.//wp:inline')[0]
+    inline.getparent().remove(inline)
+
+    anchor = OxmlElement('wp:anchor')
+    anchor.set('distT', '0')
+    anchor.set('distB', '0')
+    anchor.set('distL', '0')
+    anchor.set('distR', '0')
+    anchor.set('simplePos', '0')
+    anchor.set('relativeHeight', '251658240')
+    anchor.set('behindDoc', '0')
+    anchor.set('locked', '0')
+    anchor.set('layoutInCell', '1')
+    anchor.set('allowOverlap', '1')
+
+    simple = OxmlElement('wp:simplePos')
+    simple.set('x', '0'); simple.set('y', '0')
+    anchor.append(simple)
+
+    posH = OxmlElement('wp:positionH')
+    posH.set('relativeFrom', 'page')
+    alignH = OxmlElement('wp:align')
+    alignH.text = 'right'
+    posH.append(alignH)
+    anchor.append(posH)
+
+    posV = OxmlElement('wp:positionV')
+    posV.set('relativeFrom', 'margin')
+    offsetV = OxmlElement('wp:posOffset')
+    offsetV.text = '0'
+    posV.append(offsetV)
+    anchor.append(posV)
+
+    extent = inline.find(qn('wp:extent'))
+    if extent is not None:
+        anchor.append(deepcopy(extent))
+
+    effect = inline.find(qn('wp:effectExtent'))
+    if effect is not None:
+        anchor.append(deepcopy(effect))
+
+    wrap = OxmlElement('wp:wrapNone')
+    anchor.append(wrap)
+
+    docPr = inline.find(qn('wp:docPr'))
+    if docPr is not None:
+        anchor.append(deepcopy(docPr))
+
+    cNv = inline.find(qn('wp:cNvGraphicFramePr'))
+    if cNv is not None:
+        anchor.append(deepcopy(cNv))
+
+    graphic = inline.find(qn('a:graphic'))
+    if graphic is not None:
+        anchor.append(deepcopy(graphic))
+
+    run._r.append(anchor)
 
 def copy_cell_properties(src_cell, dst_cell):
     # Copy the template cell properties without using CT_TcPr.clear_content(),
@@ -140,7 +200,7 @@ def fill_table_cell(cell, text, bold=False):
     p.paragraph_format.line_spacing = 1.0
     r = p.add_run(str(text))
     r.font.name = "Times New Roman"
-    r.font.size = Pt(8)
+    r.font.size = Pt(12)
     r.bold = bold
 
 def make_doc(data, filename):
@@ -231,6 +291,8 @@ def make_doc(data, filename):
         for cell in row.cells:
             for cp in cell.paragraphs:
                 for r in cp.runs:
+                    r.font.name = "Times New Roman"
+                    r.font.size = Pt(12)
                     r.bold = True
 
     # Exact 2 cm row height for every table row.
