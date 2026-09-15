@@ -100,20 +100,21 @@ def set_photo_border(cell):
         el.set(qn("w:color"), "000000")
 
 def add_photo_to_cell(cell, photo_path):
-    # Clear the template's empty paragraphs.
+    # Put the 3x4 photo directly into the template photo cell.
+    # This avoids the nested table that caused the photo to be clipped/off-page.
     for p in list(cell.paragraphs):
         clear_paragraph(p)
-    # A nested 1x1 table gives a clean black frame exactly around the 3x4 photo.
-    tbl = cell.add_table(rows=1, cols=1)
-    tbl.autofit = False
-    pc = tbl.cell(0, 0)
-    pc.width = Cm(3.2)
-    pc.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    set_photo_border(pc)
-    p = pc.paragraphs[0]
+    # Remove any nested tables left in the template cell.
+    for tbl in list(cell.tables):
+        tbl._element.getparent().remove(tbl._element)
+
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    set_photo_border(cell)
+    p = cell.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
     run = p.add_run()
     run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
 
@@ -209,13 +210,28 @@ def make_doc(data, filename):
         row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
         for i, v in enumerate(rel):
             row.cells[i].width = widths[i]
-            fill_table_cell(row.cells[i], v, False)
+            fill_table_cell(row.cells[i], v, True)
 
     # Header stays bold as in the template.
     for cell in table.rows[0].cells:
         for p in cell.paragraphs:
             for r in p.runs:
                 set_run(r, True)
+
+    # Make every visible text element on page 2 bold, including the title and all table text.
+    for p2 in doc.paragraphs:
+        # Page-2 content is after the page break in the template; bolding all
+        # document paragraphs is harmless for the existing page-1 labels because
+        # their intended bold/non-bold runs were already set above.
+        for r in p2.runs:
+            if p2 is p:
+                set_run(r, True)
+
+    for row in table.rows:
+        for cell in row.cells:
+            for cp in cell.paragraphs:
+                for r in cp.runs:
+                    r.bold = True
 
     # Exact 2 cm row height for every table row.
     for row in table.rows:
