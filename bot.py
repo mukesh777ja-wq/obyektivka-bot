@@ -117,11 +117,17 @@ def add_photo_to_cell(cell, photo_path):
     run = p.add_run()
     run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
 
+def copy_cell_properties(src_cell, dst_cell):
+    # Copy the template cell properties without using CT_TcPr.clear_content(),
+    # which is not available in some python-docx versions.
+    src_tcPr = src_cell._tc.get_or_add_tcPr()
+    dst_tcPr = dst_cell._tc.get_or_add_tcPr()
+    dst_tcPr.getparent().replace(dst_tcPr, deepcopy(src_tcPr))
+
 def copy_row_format(src_row, dst_row):
     # Copy cell properties from the first data row of the template.
     for s, d in zip(src_row.cells, dst_row.cells):
-        d._tc.get_or_add_tcPr().clear_content()
-        d._tc.get_or_add_tcPr().extend(deepcopy(s._tc.get_or_add_tcPr()))
+        copy_cell_properties(s, d)
         d.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
 def fill_table_cell(cell, text, bold=False):
@@ -198,8 +204,7 @@ def make_doc(data, filename):
         row = table.add_row()
         # Copy row/cell properties from the template's original first data row.
         for s, d in zip(template_data_row.cells, row.cells):
-            d._tc.get_or_add_tcPr().clear_content()
-            d._tc.get_or_add_tcPr().extend(deepcopy(s._tc.get_or_add_tcPr()))
+            copy_cell_properties(s, d)
         row.height = Cm(2)
         row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
         for i, v in enumerate(rel):
