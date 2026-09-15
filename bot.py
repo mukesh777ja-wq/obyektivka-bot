@@ -99,29 +99,17 @@ def set_photo_border(cell):
         el.set(qn("w:space"), "0")
         el.set(qn("w:color"), "000000")
 
-def add_photo_to_cell(cell, photo_path):
-    """Insert a 3x4 photo as a valid floating Word drawing ('Перед текстом')."""
-    # Clear the cell while preserving the cell itself and its borders.
-    for p in list(cell.paragraphs):
-        clear_paragraph(p)
-    for tbl in list(cell.tables):
-        tbl._element.getparent().remove(tbl._element)
-
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-    set_photo_border(cell)
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+def add_photo_floating(doc, anchor_paragraph, photo_path):
+    """Insert a 3x4 cm photo as a valid floating Word drawing (In Front of Text).
+    The picture is positioned on page 1 at the upper-right, independent of the
+    oversized template table's second column.
+    """
+    p = anchor_paragraph
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(0)
-    p.paragraph_format.line_spacing = 1.0
-
     run = p.add_run()
     run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
 
-    # python-docx creates a valid wp:inline. Convert that exact element to
-    # wp:anchor instead of rebuilding the drawing contents. This keeps the
-    # image relationship/graphic data intact and produces Word's
-    # "Перед текстом" (In Front of Text) layout without corrupting the DOCX.
     drawing = run._r.xpath('./w:drawing')[0]
     inline = drawing.xpath('./wp:inline')[0]
     inline.tag = qn('wp:anchor')
@@ -134,13 +122,14 @@ def add_photo_to_cell(cell, photo_path):
     anchor.set('relativeHeight', '251658240')
     anchor.set('behindDoc', '0')
     anchor.set('locked', '0')
-    anchor.set('layoutInCell', '1')
+    anchor.set('layoutInCell', '0')
     anchor.set('allowOverlap', '1')
 
-    # Rebuild only the required positioning/wrapping nodes; keep the existing
-    # extent, docPr, cNvGraphicFramePr and graphic nodes untouched.
+    # Remove inline/anchor positioning and wrapping nodes if present.
     for child in list(anchor):
-        if child.tag in (qn('wp:positionH'), qn('wp:positionV'), qn('wp:simplePos'), qn('wp:wrapNone')):
+        if child.tag in (qn('wp:positionH'), qn('wp:positionV'), qn('wp:simplePos'),
+                         qn('wp:wrapNone'), qn('wp:wrapSquare'), qn('wp:wrapTight'),
+                         qn('wp:wrapThrough'), qn('wp:wrapTopAndBottom')):
             anchor.remove(child)
 
     simple = OxmlElement('wp:simplePos')
@@ -148,25 +137,27 @@ def add_photo_to_cell(cell, photo_path):
     simple.set('y', '0')
     anchor.insert(0, simple)
 
+    # A4 page: place the 3 cm photo near the upper-right corner, inside the
+    # printable area.  X/Y are absolute offsets from the page edge.
     pos_h = OxmlElement('wp:positionH')
     pos_h.set('relativeFrom', 'page')
     off_h = OxmlElement('wp:posOffset')
-    off_h.text = '0'
+    off_h.text = str(int(Cm(17.0)))
     pos_h.append(off_h)
     anchor.insert(1, pos_h)
 
     pos_v = OxmlElement('wp:positionV')
-    pos_v.set('relativeFrom', 'margin')
+    pos_v.set('relativeFrom', 'page')
     off_v = OxmlElement('wp:posOffset')
-    off_v.text = '0'
+    off_v.text = str(int(Cm(3.6)))
     pos_v.append(off_v)
     anchor.insert(2, pos_v)
 
-    # In Front of Text = no text wrapping around the picture.
+    # Word's "Перед текстом" (In Front of Text).
     wrap = OxmlElement('wp:wrapNone')
-    # Insert before docPr (after extent/effectExtent).
     docpr_index = next((i for i, c in enumerate(anchor) if c.tag == qn('wp:docPr')), len(anchor))
     anchor.insert(docpr_index, wrap)
+
 
 def copy_cell_properties(src_cell, dst_cell):
     # Copy the template cell properties without using CT_TcPr.clear_content(),
@@ -220,8 +211,24 @@ def make_doc(data, filename):
     for p in paras:
         p.paragraph_format.line_spacing = 2.5
 
-    photo_cell = info.cell(0, 1)
-    add_photo_to_cell(photo_cell, data["photo"])
+    # Keep the template table within the A4 page and leave its second cell blank.
+    # The photo itself is a floating "In Front of Text" drawing positioned on page 1.
+    info.autofit = False
+    tblPr = info._tbl.tblPr
+    tblW = tblPr.find(qn("w:tblW"))
+    if tblW is None:
+        tblW = OxmlElement("w:tblW")
+        tblPr.insert(0, tblW)
+    tblW.set(qn("w:type"), "dxa")
+    tblW.set(qn("w:w"), str(int(Cm(18.0))))
+    first_cell = info.cell(0, 0)
+    second_cell = info.cell(0, 1)
+    first_cell.width = Cm(14.8)
+    second_cell.width = Cm(3.2)
+    clear_paragraph(second_cell.paragraphs[0])
+    for ptmp in list(second_cell.paragraphs)[1:]:
+        ptmp._element.getparent().remove(ptmp._element)
+    add_photo_floating(doc, doc.paragraphs[1], data["photo"])
 
     # Page 1 headings already exist in the template.
     work_p = doc.paragraphs[3]
@@ -422,22 +429,18 @@ async def create_obyektivka(message: Message, state: FSMContext):
         return
 
     await message.answer("Ma’lumotnoma tayyorlanmoqda, biroz kuting...")
-    # Fayl nomi: Ma'lumotnoma_Ism_001.docx, keyingi hujjat 002, 003...
-    # FIO odatda: Familiya Ism Sharifingiz. Ikkinchi qismni ism sifatida olamiz.
-    fio_parts = data.get("fio", "").strip().split()
-    ism = fio_parts[1] if len(fio_parts) >= 2 else (fio_parts[0] if fio_parts else "Foydalanuvchi")
-    # Windows/Word uchun noqulay belgilarni olib tashlaymiz.
-    safe_ism = "".join(ch for ch in ism if ch.isalnum() or ch in "-_'") or "Foydalanuvchi"
-
+    # File name: Ma'lumotnoma_Ism_001.docx, then 002, 003, ...
+    fio_parts = data["fio"].strip().split()
+    person_name = fio_parts[1] if len(fio_parts) >= 2 else fio_parts[0]
+    safe_name = "".join(ch for ch in person_name if ch.isalnum() or ch in "_'’-")
     existing_numbers = []
-    for old_file in OUT.glob("Malumotnoma_*_[0-9][0-9][0-9].docx"):
+    for old_file in OUT.glob(f"Ma'lumotnoma_{safe_name}_*.docx"):
         try:
-            existing_numbers.append(int(old_file.stem.rsplit("_", 1)[1]))
-        except (ValueError, IndexError):
+            existing_numbers.append(int(old_file.stem.rsplit("_", 1)[-1]))
+        except ValueError:
             pass
     next_number = max(existing_numbers, default=0) + 1
-    filename = OUT / f"Malumotnoma_{safe_ism}_{next_number:03d}.docx"
-
+    filename = OUT / f"Ma'lumotnoma_{safe_name}_{next_number:03d}.docx"
     try:
         make_doc(data, filename)
         await message.answer_document(
