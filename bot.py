@@ -1,22 +1,26 @@
 import os
 import asyncio
 from pathlib import Path
+from copy import deepcopy
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, Update
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, Update
+
 from docx import Document
-from docx.shared import Cm, Pt
+from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_CELL_VERTICAL_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OUT = Path("output")
+BASE = Path(__file__).resolve().parent
+TEMPLATE = BASE / "template.docx"
+OUT = BASE / "output"
 OUT.mkdir(exist_ok=True)
 
 class Form(StatesGroup):
@@ -42,196 +46,172 @@ def no_kb():
         resize_keyboard=True
     )
 
-def set_cell(cell, text, bold=False):
-    cell.text = ""
-    p = cell.paragraphs[0]
-    r = p.add_run(str(text))
-    r.bold = bold
-    r.font.name = "Times New Roman"
-    r.font.size = Pt(8)
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+def set_run(run, bold):
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(12)
+    run.bold = bold
 
-def make_doc(data, filename):
-    from docx.enum.table import WD_ROW_HEIGHT_RULE
+def clear_paragraph(p):
+    for child in list(p._p):
+        if child.tag != qn("w:pPr"):
+            p._p.remove(child)
 
-    doc = Document()
-    sec = doc.sections[0]
-    sec.top_margin = Cm(1.5)
-    sec.bottom_margin = Cm(1.5)
-    sec.left_margin = Cm(1.7)
-    sec.right_margin = Cm(1.5)
+def put_label_value(p, label, value):
+    clear_paragraph(p)
+    r = p.add_run(label)
+    set_run(r, True)
+    r = p.add_run(str(value))
+    set_run(r, False)
 
-    def style_run(run, size=10, bold=False):
-        run.font.name = "Times New Roman"
-        run.font.size = Pt(size)
-        run.bold = bold
+def put_two_fields(p, label1, value1, label2, value2, spaces=45):
+    clear_paragraph(p)
+    r = p.add_run(label1)
+    set_run(r, True)
+    r = p.add_run(str(value1))
+    set_run(r, False)
+    r = p.add_run(" " * spaces)
+    set_run(r, False)
+    r = p.add_run(label2)
+    set_run(r, True)
+    r = p.add_run(str(value2))
+    set_run(r, False)
 
-    def style_paragraph(p, align=None, before=0, after=0, line=3):
-        if align is not None:
-            p.alignment = align
-        pf = p.paragraph_format
-        pf.space_before = Pt(before)
-        pf.space_after = Pt(after)
-        pf.line_spacing = line
-
-    # ===== 1-BET =====
-    p = doc.add_paragraph()
-    style_paragraph(p, WD_ALIGN_PARAGRAPH.CENTER, after=2, line=3)
-    style_run(p.add_run("MA’LUMOTNOMA"), 14, True)
-
-    p = doc.add_paragraph()
-    style_paragraph(p, WD_ALIGN_PARAGRAPH.CENTER, after=4, line=3)
-    style_run(p.add_run(data["fio"]), 11, True)
-
-    # Two-column block, matching the reference image.
-    info = doc.add_table(rows=1, cols=2)
-    info.autofit = False
-    info.columns[0].width = Cm(8.0)
-    info.columns[1].width = Cm(7.0)
-
-    left = [
-        ("Tug‘ilgan yili:", data["birth"]),
-        ("Millati:", data["nationality"]),
-        ("Ma’lumoti:", data["education"]),
-        ("Ma’lumoti bo‘yicha mutaxassisligi:", data["specialty"]),
-        ("Ilmiy darajasi:", data["degree"]),
-        ("Qaysi chet tillarini biladi:", data["languages"]),
-        ("Davlat mukofotlari bilan taqdirlanganligi (qanaqa):", data["awards"]),
-        ("Xalq deputatlari respublika, viloyat, shahar va tuman Kengashlari deputatligi yoki boshqa saylanadigan organlarida a’zoligi (to‘liq ko‘rsatilishi lozim):", data["elected"]),
-    ]
-    right = [
-        ("Tug‘ilgan joyi:", data["birth_place"]),
-        ("Partiyaviyligi:", data["party"]),
-        ("Tamomlagan:", data["graduated"]),
-    ]
-
-    for cell, items in zip(info.rows[0].cells, (left, right)):
-        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-        cell.text = ""
-        for label, value in items:
-            p = cell.add_paragraph() if cell.paragraphs[0].text else cell.paragraphs[0]
-            style_paragraph(p, after=1, line=3)
-            style_run(p.add_run(label + " "), 9, True)
-            style_run(p.add_run(value), 9, False)
-
-    # Remove visible borders from the info table.
-    tblPr = info._tbl.tblPr
-    borders = tblPr.first_child_found_in("w:tblBorders")
+def set_photo_border(cell):
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.first_child_found_in("w:tcBorders")
     if borders is None:
-        from docx.oxml import OxmlElement
-        borders = OxmlElement("w:tblBorders")
-        tblPr.append(borders)
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        borders = OxmlElement("w:tcBorders")
+        tcPr.append(borders)
+    for edge in ("top", "left", "bottom", "right"):
         tag = "w:" + edge
         el = borders.find(qn(tag))
         if el is None:
             el = OxmlElement(tag)
             borders.append(el)
-        el.set(qn("w:val"), "nil")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "12")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "000000")
 
-    # Put the uploaded 3x4 photo at the top-right of the right column.
-    photo = data.get("photo")
-    if photo and Path(photo).exists():
-        # 3x4 photo with a clear black border.
-        cell = info.rows[0].cells[1]
-        while len(cell.paragraphs) > 0:
-            p = cell.paragraphs[0]
-            p._element.getparent().remove(p._element)
+def add_photo_to_cell(cell, photo_path):
+    # Clear the template's empty paragraphs.
+    for p in list(cell.paragraphs):
+        clear_paragraph(p)
+    # A nested 1x1 table gives a clean black frame exactly around the 3x4 photo.
+    tbl = cell.add_table(rows=1, cols=1)
+    tbl.autofit = False
+    pc = tbl.cell(0, 0)
+    pc.width = Cm(3.2)
+    pc.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    set_photo_border(pc)
+    p = pc.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    run = p.add_run()
+    run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
 
-        photo_tbl = cell.add_table(rows=1, cols=1)
-        photo_tbl.autofit = False
-        photo_cell = photo_tbl.cell(0, 0)
-        photo_cell.width = Cm(3.2)
-        photo_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+def copy_row_format(src_row, dst_row):
+    # Copy cell properties from the first data row of the template.
+    for s, d in zip(src_row.cells, dst_row.cells):
+        d._tc.get_or_add_tcPr().clear_content()
+        d._tc.get_or_add_tcPr().extend(deepcopy(s._tc.get_or_add_tcPr()))
+        d.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
-        p = photo_cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_before = Pt(1)
-        p.paragraph_format.space_after = Pt(1)
-        run = p.add_run()
-        run.add_picture(photo, width=Cm(3.0), height=Cm(4.0))
+def fill_table_cell(cell, text, bold=False):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+    r = p.add_run(str(text))
+    r.font.name = "Times New Roman"
+    r.font.size = Pt(8)
+    r.bold = bold
 
-        # Black border around the photo cell.
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-        tcPr = photo_cell._tc.get_or_add_tcPr()
-        borders = tcPr.first_child_found_in("w:tcBorders")
-        if borders is None:
-            borders = OxmlElement("w:tcBorders")
-            tcPr.append(borders)
-        for edge in ("top", "left", "bottom", "right"):
-            tag = "w:" + edge
-            el = borders.find(qn(tag))
-            if el is None:
-                el = OxmlElement(tag)
-                borders.append(el)
-            el.set(qn("w:val"), "single")
-            el.set(qn("w:sz"), "12")
-            el.set(qn("w:space"), "0")
-            el.set(qn("w:color"), "000000")
+def make_doc(data, filename):
+    doc = Document(str(TEMPLATE))
 
-        # Fixed labels are bold; values entered by the user remain regular.
-        for label, value in right:
-            p = cell.add_paragraph()
-            style_paragraph(p, after=1, line=3)
-            style_run(p.add_run(label + " "), 9, True)
-            style_run(p.add_run(value), 9, False)
+    # Page 1: use the uploaded Word document as the actual template.
+    p = doc.paragraphs[1]
+    put_label_value(p, "", data["fio"])
+    for run in p.runs:
+        set_run(run, True)
 
-    p = doc.add_paragraph()
-    style_paragraph(p, WD_ALIGN_PARAGRAPH.CENTER, before=3, after=2, line=3)
-    style_run(p.add_run("MEHNAT FAOLIYATI"), 12, True)
+    info = doc.tables[0]
+    left = info.cell(0, 0)
+    paras = left.paragraphs
 
-    for work in data.get("work", []):
-        p = doc.add_paragraph()
-        style_paragraph(p, after=1, line=3)
-        style_run(p.add_run(work), 9, False)
+    put_label_value(paras[0], "Tug‘ilgan yili: ", data["birth"])
+    put_label_value(paras[1], "Tug‘ilgan joyi: ", data["birth_place"])
+    put_two_fields(paras[2], "Millati: ", data["nationality"], "Partiyaviyligi: ", data["party"], spaces=43)
+    put_label_value(paras[3], "Ma’lumoti: ", data["education"])
+    put_label_value(paras[4], "Tamomlagan: ", data["graduated"])
+    put_label_value(paras[5], "Ma’lumoti bo‘yicha mutaxassisligi: ", data["specialty"])
+    put_two_fields(paras[6], "Qaysi chet tillarini biladi: ", data["languages"], "Ilmiy darajasi: ", data["degree"], spaces=38)
+    put_label_value(paras[7], "Davlat mukofotlari bilan taqdirlanganligi (qanaqa): ", data["awards"])
+    put_label_value(paras[8], "Xalq deputatlari respublika, viloyat, shahar va tuman Kengashlari deputatligi yoki boshqa saylanadigan organlarida a’zoligi (to‘liq ko‘rsatilishi lozim): ", data["elected"])
 
-    # ===== 2-BET =====
-    doc.add_page_break()
+    # Preserve the template's paragraph spacing/line spacing.
+    for p in paras:
+        p.paragraph_format.line_spacing = 2.5
 
-    p = doc.add_paragraph()
-    style_paragraph(p, WD_ALIGN_PARAGRAPH.CENTER, after=1, line=3)
-    style_run(p.add_run(f'{data["fio"]}ning yaqin qarindoshlari haqida'), 10, True)
+    photo_cell = info.cell(0, 1)
+    add_photo_to_cell(photo_cell, data["photo"])
 
-    p = doc.add_paragraph()
-    style_paragraph(p, WD_ALIGN_PARAGRAPH.CENTER, after=2, line=3)
-    style_run(p.add_run("MA’LUMOT"), 12, True)
+    # Page 1 headings already exist in the template.
+    work_p = doc.paragraphs[3]
+    work_p.text = ""
+    for idx, work in enumerate(data.get("work", [])):
+        if idx == 0:
+            p = work_p
+        else:
+            p = doc.add_paragraph()
+        r = p.add_run(work)
+        set_run(r, False)
+        p.paragraph_format.line_spacing = 2.5
 
-    table = doc.add_table(rows=1, cols=5)
-    table.style = "Table Grid"
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = False
+    # Page 2 title uses the template paragraph, only the FIO changes.
+    p = doc.paragraphs[5]
+    put_label_value(p, "", f'{data["fio"]}ning yaqin qarindoshlari haqida')
+    for run in p.runs:
+        set_run(run, True)
 
-    widths = [Cm(2.4), Cm(4.3), Cm(4.0), Cm(4.1), Cm(4.0)]
-    headers = [
-        "Qarindoshligi",
-        "Familiyasi, ismi va otasining ismi",
-        "Tug‘ilgan yili va joyi",
-        "Ish joyi va lavozimi",
-        "Turar joyi",
-    ]
+    table = doc.tables[1]
+    template_data_row = table.rows[1]
 
-    for i, h in enumerate(headers):
-        cell = table.rows[0].cells[i]
-        cell.width = widths[i]
-        set_cell(cell, h, True)
+    # Remove all existing data rows, keep the header.
+    while len(table.rows) > 1:
+        tr = table.rows[-1]._tr
+        tr.getparent().remove(tr)
 
-    # Header row also kept at 2 cm.
-    table.rows[0].height = Cm(2)
-    table.rows[0].height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+    widths = [Cm(2.8), Cm(3.6), Cm(3.4), Cm(3.5), Cm(3.4)]
 
     for rel in data.get("relatives", []):
         row = table.add_row()
+        # Copy row/cell properties from the template's original first data row.
+        for s, d in zip(template_data_row.cells, row.cells):
+            d._tc.get_or_add_tcPr().clear_content()
+            d._tc.get_or_add_tcPr().extend(deepcopy(s._tc.get_or_add_tcPr()))
         row.height = Cm(2)
         row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
         for i, v in enumerate(rel):
-            cell = row.cells[i]
-            cell.width = widths[i]
-            set_cell(cell, v)
+            row.cells[i].width = widths[i]
+            fill_table_cell(row.cells[i], v, False)
 
-    doc.save(filename)
+    # Header stays bold as in the template.
+    for cell in table.rows[0].cells:
+        for p in cell.paragraphs:
+            for r in p.runs:
+                set_run(r, True)
+
+    # Exact 2 cm row height for every table row.
+    for row in table.rows:
+        row.height = Cm(2)
+        row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+
+    doc.save(str(filename))
 
 dp = Dispatcher()
 
@@ -316,7 +296,6 @@ async def elected(message: Message, state: FSMContext):
     await state.set_state(Form.work)
     await message.answer(
         "Mehnat faoliyatingizni kiriting.\n"
-        "Masalan: 2018-2020 yy. — Tashkilot — lavozim.\n"
         "Har bir ish joyini alohida yuboring.\n"
         "Tugatish uchun YO‘Q bosing."
     )
@@ -329,7 +308,6 @@ async def work(message: Message, state: FSMContext):
         await state.set_state(Form.photo)
         await message.answer("3x4 rasmingizni foto sifatida yuboring:")
         return
-
     arr = data.get("work", [])
     arr.append(text)
     await state.update_data(work=arr)
@@ -355,15 +333,11 @@ async def photo_wrong(message: Message, state: FSMContext):
 @dp.message(Form.relative)
 async def relative(message: Message, state: FSMContext):
     text = message.text.strip()
-
     if text.upper() == "TAYYORLASH":
         data = await state.get_data()
         filename = OUT / f"Malumotnoma_{message.from_user.id}.docx"
         make_doc(data, filename)
-        await message.answer_document(
-            FSInputFile(filename),
-            caption="Ma’lumotnomangiz tayyor."
-        )
+        await message.answer_document(FSInputFile(filename), caption="Ma’lumotnomangiz tayyor.")
         await state.clear()
         return
 
@@ -374,14 +348,11 @@ async def relative(message: Message, state: FSMContext):
             "Ota | F.I.Sh. | Tug‘ilgan yili va joyi | Ish joyi va lavozimi | Turar joyi"
         )
         return
-
     data = await state.get_data()
     relatives = data.get("relatives", [])
     relatives.append(parts)
     await state.update_data(relatives=relatives)
-    await message.answer(
-        "Qabul qilindi. Keyingi qarindoshni kiriting yoki TAYYORLASH deb yozing."
-    )
+    await message.answer("Qabul qilindi. Keyingi qarindoshni kiriting yoki TAYYORLASH deb yozing.")
 
 async def health(request):
     return web.Response(text="OK")
@@ -398,16 +369,9 @@ async def telegram_webhook(request):
 
 async def on_startup(app):
     bot = app["bot"]
-
-    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    external_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("EXTERNAL_URL")
     if not external_url:
-        external_url = os.environ.get("EXTERNAL_URL")
-
-    if not external_url:
-        raise RuntimeError(
-            "RENDER_EXTERNAL_URL topilmadi. Render Web Service URL manzili kerak."
-        )
-
+        raise RuntimeError("RENDER_EXTERNAL_URL topilmadi.")
     webhook_url = external_url.rstrip("/") + "/telegram/webhook"
     await bot.set_webhook(webhook_url, drop_pending_updates=True)
     print(f"Telegram webhook set: {webhook_url}")
@@ -421,24 +385,19 @@ async def on_cleanup(app):
 
 async def main():
     bot = Bot(BOT_TOKEN)
-
     app = web.Application()
     app["bot"] = bot
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_post("/telegram/webhook", telegram_webhook)
-
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
-
     port = int(os.environ.get("PORT", "10000"))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-
     print(f"Web service listening on port {port}")
-
     try:
         await asyncio.Event().wait()
     finally:
