@@ -337,17 +337,35 @@ async def photo(message: Message, state: FSMContext):
 async def photo_wrong(message: Message, state: FSMContext):
     await message.answer("Iltimos, rasmni foto sifatida yuboring.")
 
-@dp.message(Form.relative)
-async def relative(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "OBYEKTIVKA YARATISH":
-        data = await state.get_data()
-        filename = OUT / f"Malumotnoma_{message.from_user.id}.docx"
-        make_doc(data, filename)
-        await message.answer_document(FSInputFile(filename), caption="Ma’lumotnomangiz tayyor.")
-        await state.clear()
+@dp.message(F.text == "OBYEKTIVKA YARATISH")
+async def create_obyektivka(message: Message, state: FSMContext):
+    # This handler is intentionally NOT tied to Form.relative.
+    # Render Free may restart the process and clear aiogram MemoryStorage.
+    data = await state.get_data()
+    if not data or not data.get("fio") or not data.get("photo"):
+        await message.answer(
+            "Ma’lumotlar sessiyasi tugagan. Iltimos, /start bosib ma’lumotnomani qaytadan to‘ldiring."
+        )
         return
 
+    await message.answer("Ma’lumotnoma tayyorlanmoqda, biroz kuting...")
+    filename = OUT / f"Malumotnoma_{message.from_user.id}.docx"
+    try:
+        make_doc(data, filename)
+        await message.answer_document(
+            FSInputFile(filename),
+            caption="Ma’lumotnomangiz tayyor."
+        )
+        await state.clear()
+    except Exception as e:
+        print(f"CREATE DOCUMENT ERROR: {type(e).__name__}: {e}", flush=True)
+        await message.answer(
+            "Hujjat yaratishda xatolik yuz berdi. Xato Render Logs'ga yozildi."
+        )
+
+@dp.message(Form.relative, F.text)
+async def relative(message: Message, state: FSMContext):
+    text = message.text.strip()
     parts = [x.strip() for x in text.split("|")]
     if len(parts) != 5:
         await message.answer(
