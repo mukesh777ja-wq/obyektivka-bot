@@ -100,16 +100,17 @@ def set_photo_border(cell):
         el.set(qn("w:color"), "000000")
 
 def add_photo_to_cell(cell, photo_path):
-    """Insert a floating 3x4 photo, equivalent to Word's 'Перед текстом'."""
+    """Insert a 3x4 photo as a valid floating Word drawing ('Перед текстом')."""
+    # Clear the cell while preserving the cell itself and its borders.
     for p in list(cell.paragraphs):
         clear_paragraph(p)
     for tbl in list(cell.tables):
         tbl._element.getparent().remove(tbl._element)
 
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
     set_photo_border(cell)
     p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(0)
     p.paragraph_format.line_spacing = 1.0
@@ -117,13 +118,14 @@ def add_photo_to_cell(cell, photo_path):
     run = p.add_run()
     run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
 
-    # Convert the inline picture to a floating drawing.  This is the Word
-    # layout mode "Перед текстом" (In Front of Text), so the picture can be
-    # positioned independently instead of being clipped by the table column.
-    inline = run._r.xpath('.//wp:inline')[0]
-    inline.getparent().remove(inline)
-
-    anchor = OxmlElement('wp:anchor')
+    # python-docx creates a valid wp:inline. Convert that exact element to
+    # wp:anchor instead of rebuilding the drawing contents. This keeps the
+    # image relationship/graphic data intact and produces Word's
+    # "Перед текстом" (In Front of Text) layout without corrupting the DOCX.
+    drawing = run._r.xpath('./w:drawing')[0]
+    inline = drawing.xpath('./wp:inline')[0]
+    inline.tag = qn('wp:anchor')
+    anchor = inline
     anchor.set('distT', '0')
     anchor.set('distB', '0')
     anchor.set('distL', '0')
@@ -135,48 +137,36 @@ def add_photo_to_cell(cell, photo_path):
     anchor.set('layoutInCell', '1')
     anchor.set('allowOverlap', '1')
 
+    # Rebuild only the required positioning/wrapping nodes; keep the existing
+    # extent, docPr, cNvGraphicFramePr and graphic nodes untouched.
+    for child in list(anchor):
+        if child.tag in (qn('wp:positionH'), qn('wp:positionV'), qn('wp:simplePos'), qn('wp:wrapNone')):
+            anchor.remove(child)
+
     simple = OxmlElement('wp:simplePos')
-    simple.set('x', '0'); simple.set('y', '0')
-    anchor.append(simple)
+    simple.set('x', '0')
+    simple.set('y', '0')
+    anchor.insert(0, simple)
 
-    posH = OxmlElement('wp:positionH')
-    posH.set('relativeFrom', 'page')
-    alignH = OxmlElement('wp:align')
-    alignH.text = 'right'
-    posH.append(alignH)
-    anchor.append(posH)
+    pos_h = OxmlElement('wp:positionH')
+    pos_h.set('relativeFrom', 'page')
+    off_h = OxmlElement('wp:posOffset')
+    off_h.text = '0'
+    pos_h.append(off_h)
+    anchor.insert(1, pos_h)
 
-    posV = OxmlElement('wp:positionV')
-    posV.set('relativeFrom', 'margin')
-    offsetV = OxmlElement('wp:posOffset')
-    offsetV.text = '0'
-    posV.append(offsetV)
-    anchor.append(posV)
+    pos_v = OxmlElement('wp:positionV')
+    pos_v.set('relativeFrom', 'margin')
+    off_v = OxmlElement('wp:posOffset')
+    off_v.text = '0'
+    pos_v.append(off_v)
+    anchor.insert(2, pos_v)
 
-    extent = inline.find(qn('wp:extent'))
-    if extent is not None:
-        anchor.append(deepcopy(extent))
-
-    effect = inline.find(qn('wp:effectExtent'))
-    if effect is not None:
-        anchor.append(deepcopy(effect))
-
+    # In Front of Text = no text wrapping around the picture.
     wrap = OxmlElement('wp:wrapNone')
-    anchor.append(wrap)
-
-    docPr = inline.find(qn('wp:docPr'))
-    if docPr is not None:
-        anchor.append(deepcopy(docPr))
-
-    cNv = inline.find(qn('wp:cNvGraphicFramePr'))
-    if cNv is not None:
-        anchor.append(deepcopy(cNv))
-
-    graphic = inline.find(qn('a:graphic'))
-    if graphic is not None:
-        anchor.append(deepcopy(graphic))
-
-    run._r.append(anchor)
+    # Insert before docPr (after extent/effectExtent).
+    docpr_index = next((i for i, c in enumerate(anchor) if c.tag == qn('wp:docPr')), len(anchor))
+    anchor.insert(docpr_index, wrap)
 
 def copy_cell_properties(src_cell, dst_cell):
     # Copy the template cell properties without using CT_TcPr.clear_content(),
@@ -432,7 +422,22 @@ async def create_obyektivka(message: Message, state: FSMContext):
         return
 
     await message.answer("Ma’lumotnoma tayyorlanmoqda, biroz kuting...")
-    filename = OUT / f"Malumotnoma_{message.from_user.id}.docx"
+    # Fayl nomi: Ma'lumotnoma_Ism_001.docx, keyingi hujjat 002, 003...
+    # FIO odatda: Familiya Ism Sharifingiz. Ikkinchi qismni ism sifatida olamiz.
+    fio_parts = data.get("fio", "").strip().split()
+    ism = fio_parts[1] if len(fio_parts) >= 2 else (fio_parts[0] if fio_parts else "Foydalanuvchi")
+    # Windows/Word uchun noqulay belgilarni olib tashlaymiz.
+    safe_ism = "".join(ch for ch in ism if ch.isalnum() or ch in "-_'") or "Foydalanuvchi"
+
+    existing_numbers = []
+    for old_file in OUT.glob("Malumotnoma_*_[0-9][0-9][0-9].docx"):
+        try:
+            existing_numbers.append(int(old_file.stem.rsplit("_", 1)[1]))
+        except (ValueError, IndexError):
+            pass
+    next_number = max(existing_numbers, default=0) + 1
+    filename = OUT / f"Malumotnoma_{safe_ism}_{next_number:03d}.docx"
+
     try:
         make_doc(data, filename)
         await message.answer_document(
