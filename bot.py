@@ -16,6 +16,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_CELL_VERTICAL_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE = Path(__file__).resolve().parent
@@ -142,14 +143,14 @@ def add_photo_floating(doc, anchor_paragraph, photo_path):
     pos_h = OxmlElement('wp:positionH')
     pos_h.set('relativeFrom', 'page')
     off_h = OxmlElement('wp:posOffset')
-    off_h.text = str(int(Cm(17.0)))
+    off_h.text = str(int(Cm(17.2)))
     pos_h.append(off_h)
     anchor.insert(1, pos_h)
 
     pos_v = OxmlElement('wp:positionV')
     pos_v.set('relativeFrom', 'page')
     off_v = OxmlElement('wp:posOffset')
-    off_v.text = str(int(Cm(3.6)))
+    off_v.text = str(int(Cm(3.4)))
     pos_v.append(off_v)
     anchor.insert(2, pos_v)
 
@@ -212,7 +213,8 @@ def make_doc(data, filename):
         p.paragraph_format.line_spacing = 2.5
 
     # Keep the template table within the A4 page and leave its second cell blank.
-    # The photo itself is a floating "In Front of Text" drawing positioned on page 1.
+    # The photo is anchored in a top-level body paragraph (not inside the table),
+    # so Word does not clip it to the table cell.
     info.autofit = False
     tblPr = info._tbl.tblPr
     tblW = tblPr.find(qn("w:tblW"))
@@ -228,7 +230,11 @@ def make_doc(data, filename):
     clear_paragraph(second_cell.paragraphs[0])
     for ptmp in list(second_cell.paragraphs)[1:]:
         ptmp._element.getparent().remove(ptmp._element)
-    add_photo_floating(doc, doc.paragraphs[1], data["photo"])
+    # Create a body-level anchor paragraph immediately before the info table.
+    photo_p_el = OxmlElement("w:p")
+    info._tbl.addprevious(photo_p_el)
+    photo_p = Paragraph(photo_p_el, info._parent)
+    add_photo_floating(doc, photo_p, data["photo"])
 
     # Page 1 headings already exist in the template.
     work_p = doc.paragraphs[3]
