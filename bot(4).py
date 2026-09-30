@@ -1,0 +1,758 @@
+import os
+import asyncio
+from pathlib import Path
+from copy import deepcopy
+
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, Update
+
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_CELL_VERTICAL_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+# Owner/admin Telegram ID. The generated .docx is sent ONLY to this account.
+# Render Environment Variables can override the default value.
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "363937706"))
+BASE = Path(__file__).resolve().parent
+TEMPLATE = BASE / "template.docx"
+OUT = BASE / "output"
+OUT.mkdir(exist_ok=True)
+
+# Prevent two users from generating documents at the same time.
+GENERATION_LOCK = asyncio.Lock()
+
+class Form(StatesGroup):
+    fio = State()
+    birth = State()
+    birth_place = State()
+    nationality = State()
+    party = State()
+    education = State()
+    graduated = State()
+    specialty = State()
+    degree = State()
+    languages = State()
+    awards = State()
+    elected = State()
+    work = State()
+    photo = State()
+    relative = State()
+
+
+def is_no(text: str) -> bool:
+    """Recognize common Uzbek forms of 'Yo'q'."""
+    normalized = (
+        text.strip()
+        .lower()
+        .replace("’", "'")
+        .replace("ʻ", "'")
+        .replace("ʼ", "'")
+    )
+    return normalized in {"yo'q", "yoq", "yo‘q"}
+
+
+def no_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Yo'q")]],
+        resize_keyboard=True
+    )
+
+def create_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="OBYEKTIVKA YARATISH")]],
+        resize_keyboard=True
+    )
+
+def set_run(run, bold):
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(12)
+    run.bold = bold
+
+def clear_paragraph(p):
+    for child in list(p._p):
+        if child.tag != qn("w:pPr"):
+            p._p.remove(child)
+
+def remove_paragraph(p):
+    """Completely remove a paragraph from the document."""
+    el = p._element
+    parent = el.getparent()
+    if parent is not None:
+        parent.remove(el)
+
+def insert_paragraph_after(paragraph):
+    """Insert a new paragraph immediately after the given paragraph."""
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    return Paragraph(new_p, paragraph._parent)
+
+def put_label_value(p, label, value):
+    clear_paragraph(p)
+    r = p.add_run(label)
+    set_run(r, True)
+    r = p.add_run(str(value))
+    set_run(r, False)
+
+def put_two_fields(p, label1, value1, label2, value2, spaces=45):
+    clear_paragraph(p)
+    r = p.add_run(label1)
+    set_run(r, True)
+    r = p.add_run(str(value1))
+    set_run(r, False)
+    r = p.add_run(" " * spaces)
+    set_run(r, False)
+    r = p.add_run(label2)
+    set_run(r, True)
+    r = p.add_run(str(value2))
+    set_run(r, False)
+
+def set_photo_border(cell):
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.first_child_found_in("w:tcBorders")
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tcPr.append(borders)
+    for edge in ("top", "left", "bottom", "right"):
+        tag = "w:" + edge
+        el = borders.find(qn(tag))
+        if el is None:
+            el = OxmlElement(tag)
+            borders.append(el)
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "12")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "000000")
+
+def add_photo_floating(doc, anchor_paragraph, photo_path):
+    """Insert a 3x4 cm photo as a valid floating Word drawing (In Front of Text).
+    The picture is positioned on page 1 at the upper-right, independent of the
+    oversized template table's second column.
+    """
+    p = anchor_paragraph
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    run = p.add_run()
+    run.add_picture(str(photo_path), width=Cm(3.0), height=Cm(4.0))
+
+    # 1 pt black border around the 3x4 cm photo.
+    drawing = run._r.xpath('./w:drawing')[0]
+    pic_sppr = drawing.xpath('.//pic:spPr')[0]
+    old_line = pic_sppr.find(qn('a:ln'))
+    if old_line is not None:
+        pic_sppr.remove(old_line)
+    line = OxmlElement('a:ln')
+    line.set('w', '12700')  # 1 pt = 12700 EMU
+    line.set('cap', 'flat')
+    line.set('cmpd', 'sng')
+    line.set('algn', 'ctr')
+    solid_fill = OxmlElement('a:solidFill')
+    srgb = OxmlElement('a:srgbClr')
+    srgb.set('val', '000000')
+    solid_fill.append(srgb)
+    line.append(solid_fill)
+    prst_dash = OxmlElement('a:prstDash')
+    prst_dash.set('val', 'solid')
+    line.append(prst_dash)
+    round_join = OxmlElement('a:round')
+    line.append(round_join)
+    end_arrow = OxmlElement('a:headEnd')
+    end_arrow.set('type', 'none')
+    end_arrow.set('w', 'med')
+    end_arrow.set('len', 'med')
+    line.append(end_arrow)
+    tail_arrow = OxmlElement('a:tailEnd')
+    tail_arrow.set('type', 'none')
+    tail_arrow.set('w', 'med')
+    tail_arrow.set('len', 'med')
+    line.append(tail_arrow)
+    pic_sppr.append(line)
+
+    inline = drawing.xpath('./wp:inline')[0]
+    inline.tag = qn('wp:anchor')
+    anchor = inline
+    anchor.set('distT', '0')
+    anchor.set('distB', '0')
+    anchor.set('distL', '0')
+    anchor.set('distR', '0')
+    anchor.set('simplePos', '0')
+    anchor.set('relativeHeight', '251658240')
+    anchor.set('behindDoc', '0')
+    anchor.set('locked', '0')
+    anchor.set('layoutInCell', '0')
+    anchor.set('allowOverlap', '1')
+
+    # Remove inline/anchor positioning and wrapping nodes if present.
+    for child in list(anchor):
+        if child.tag in (qn('wp:positionH'), qn('wp:positionV'), qn('wp:simplePos'),
+                         qn('wp:wrapNone'), qn('wp:wrapSquare'), qn('wp:wrapTight'),
+                         qn('wp:wrapThrough'), qn('wp:wrapTopAndBottom')):
+            anchor.remove(child)
+
+    simple = OxmlElement('wp:simplePos')
+    simple.set('x', '0')
+    simple.set('y', '0')
+    anchor.insert(0, simple)
+
+    # A4 page: place the 3 cm photo near the upper-right corner, inside the
+    # printable area.  X/Y are absolute offsets from the page edge.
+    pos_h = OxmlElement('wp:positionH')
+    pos_h.set('relativeFrom', 'page')
+    off_h = OxmlElement('wp:posOffset')
+    off_h.text = str(int(Cm(17.2)))
+    pos_h.append(off_h)
+    anchor.insert(1, pos_h)
+
+    pos_v = OxmlElement('wp:positionV')
+    pos_v.set('relativeFrom', 'page')
+    off_v = OxmlElement('wp:posOffset')
+    off_v.text = str(int(Cm(3.4)))
+    pos_v.append(off_v)
+    anchor.insert(2, pos_v)
+
+    # Word's "Перед текстом" (In Front of Text).
+    wrap = OxmlElement('wp:wrapNone')
+    docpr_index = next((i for i, c in enumerate(anchor) if c.tag == qn('wp:docPr')), len(anchor))
+    anchor.insert(docpr_index, wrap)
+
+
+def copy_cell_properties(src_cell, dst_cell):
+    # Copy the template cell properties without using CT_TcPr.clear_content(),
+    # which is not available in some python-docx versions.
+    src_tcPr = src_cell._tc.get_or_add_tcPr()
+    dst_tcPr = dst_cell._tc.get_or_add_tcPr()
+    dst_tcPr.getparent().replace(dst_tcPr, deepcopy(src_tcPr))
+
+def copy_row_format(src_row, dst_row):
+    # Copy cell properties from the first data row of the template.
+    for s, d in zip(src_row.cells, dst_row.cells):
+        copy_cell_properties(s, d)
+        d.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+def fill_table_cell(cell, text, bold=False):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+    r = p.add_run(str(text))
+    r.font.name = "Times New Roman"
+    r.font.size = Pt(12)
+    r.bold = bold
+
+def make_doc(data, filename):
+    if not TEMPLATE.exists():
+        raise FileNotFoundError(f"Template topilmadi: {TEMPLATE}")
+
+    doc = Document(str(TEMPLATE))
+
+    # Keep references BEFORE inserting the floating photo paragraph.
+    # The template currently contains duplicate work/title paragraphs; those
+    # duplicates are cleaned below.
+    fio_p = doc.paragraphs[1]
+    work_p = doc.paragraphs[3]
+    duplicate_work_p = doc.paragraphs[4] if len(doc.paragraphs) > 4 else None
+    title_p = doc.paragraphs[5] if len(doc.paragraphs) > 5 else None
+    duplicate_title_p = doc.paragraphs[6] if len(doc.paragraphs) > 6 else None
+
+    # Page 1: use the uploaded Word document as the actual template.
+    put_label_value(fio_p, "", data["fio"])
+    for run in fio_p.runs:
+        set_run(run, True)
+
+    info = doc.tables[0]
+    left = info.cell(0, 0)
+    paras = left.paragraphs
+
+    put_label_value(paras[0], "Tug‘ilgan yili: ", data["birth"])
+    put_label_value(paras[1], "Tug‘ilgan joyi: ", data["birth_place"])
+    put_two_fields(paras[2], "Millati: ", data["nationality"], "Partiyaviyligi: ", data["party"], spaces=43)
+    put_label_value(paras[3], "Ma’lumoti: ", data["education"])
+    put_label_value(paras[4], "Tamomlagan: ", data["graduated"])
+    put_label_value(paras[5], "Ma’lumoti bo‘yicha mutaxassisligi: ", data["specialty"])
+    put_two_fields(paras[6], "Qaysi chet tillarini biladi: ", data["languages"], "Ilmiy darajasi: ", data["degree"], spaces=38)
+    put_label_value(paras[7], "Davlat mukofotlari bilan taqdirlanganligi (qanaqa): ", data["awards"])
+    # The long elected-office label is intentionally split into two lines so
+    # "Kengashlari deputatligi..." starts from a new line.
+    clear_paragraph(paras[8])
+    r = paras[8].add_run("Xalq deputatlari respublika, viloyat, shahar va tuman")
+    set_run(r, True)
+    r.add_break()
+    r = paras[8].add_run(
+        "Kengashlari deputatligi yoki boshqa saylanadigan organlarida "
+        "a’zoligi (to‘liq ko‘rsatilishi lozim): "
+    )
+    set_run(r, True)
+    r = paras[8].add_run(str(data["elected"]))
+    set_run(r, False)
+
+    # Preserve the template's paragraph spacing/line spacing.
+    for p in paras:
+        p.paragraph_format.line_spacing = 2.5
+
+    # Keep the template table within the A4 page and leave its second cell blank.
+    # The photo is anchored in a top-level body paragraph (not inside the table),
+    # so Word does not clip it to the table cell.
+    info.autofit = False
+    tblPr = info._tbl.tblPr
+    tblW = tblPr.find(qn("w:tblW"))
+    if tblW is None:
+        tblW = OxmlElement("w:tblW")
+        tblPr.insert(0, tblW)
+    tblW.set(qn("w:type"), "dxa")
+    tblW.set(qn("w:w"), str(int(Cm(18.0))))
+    first_cell = info.cell(0, 0)
+    second_cell = info.cell(0, 1)
+    first_cell.width = Cm(14.8)
+    second_cell.width = Cm(3.2)
+    clear_paragraph(second_cell.paragraphs[0])
+    for ptmp in list(second_cell.paragraphs)[1:]:
+        ptmp._element.getparent().remove(ptmp._element)
+    # Create a body-level anchor paragraph immediately before the info table.
+    photo_p_el = OxmlElement("w:p")
+    info._tbl.addprevious(photo_p_el)
+    photo_p = Paragraph(photo_p_el, info._parent)
+    add_photo_floating(doc, photo_p, data["photo"])
+
+    # Page 1 work history.
+    # Always show exactly one "Mehnat faoliyati:" heading, followed by the
+    # submitted work entries. This avoids duplicated work lines from the template.
+    clear_paragraph(work_p)
+    r = work_p.add_run("Mehnat faoliyati:")
+    set_run(r, True)
+    work_p.paragraph_format.line_spacing = 2.5
+
+    works = data.get("work", [])
+    previous = work_p
+    for work in works:
+        p_work = insert_paragraph_after(previous)
+        r = p_work.add_run(str(work))
+        set_run(r, False)
+        p_work.paragraph_format.line_spacing = 2.5
+        previous = p_work
+
+    # Remove the old duplicate work paragraph from the template.
+    if duplicate_work_p is not None:
+        remove_paragraph(duplicate_work_p)
+
+    # Page 2: the relatives section must begin on a completely new page.
+    # Keep only one title paragraph.
+    if title_p is not None:
+        put_label_value(title_p, "", f'{data["fio"]}ning yaqin qarindoshlari haqida')
+        for run in title_p.runs:
+            set_run(run, True)
+        title_p.paragraph_format.page_break_before = True
+        title_p.paragraph_format.space_before = Pt(0)
+        title_p.paragraph_format.space_after = Pt(6)
+
+    if duplicate_title_p is not None:
+        remove_paragraph(duplicate_title_p)
+
+    table = doc.tables[1]
+    template_data_row = table.rows[1]
+
+    # Remove all existing data rows, keep the header.
+    while len(table.rows) > 1:
+        tr = table.rows[-1]._tr
+        tr.getparent().remove(tr)
+
+    widths = [Cm(2.8), Cm(3.6), Cm(3.4), Cm(3.5), Cm(3.4)]
+
+    for rel in data.get("relatives", []):
+        row = table.add_row()
+        # Copy row/cell properties from the template's original first data row.
+        for s, d in zip(template_data_row.cells, row.cells):
+            copy_cell_properties(s, d)
+        row.height = Cm(2)
+        row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+        for i, v in enumerate(rel):
+            row.cells[i].width = widths[i]
+            fill_table_cell(row.cells[i], v, True)
+
+    # Header stays bold as in the template.
+    for cell in table.rows[0].cells:
+        for p in cell.paragraphs:
+            for r in p.runs:
+                set_run(r, True)
+
+    # Keep the page-2 title bold.
+    if title_p is not None:
+        for r in title_p.runs:
+            set_run(r, True)
+
+    for row in table.rows:
+        for cell in row.cells:
+            for cp in cell.paragraphs:
+                for r in cp.runs:
+                    r.font.name = "Times New Roman"
+                    r.font.size = Pt(12)
+                    r.bold = True
+
+    # Exact 2 cm row height for every table row.
+    for row in table.rows:
+        row.height = Cm(2)
+        row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+
+    doc.save(str(filename))
+
+dp = Dispatcher()
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Form.fio)
+    await message.answer(
+        "Assalomu alaykum! Ma’lumotnoma tuzishni boshlaymiz.\n\n"
+        "To‘liq FIO (Familiya Ism Sharifingiz) kiriting:"
+    )
+
+@dp.message(Form.fio)
+async def fio(message: Message, state: FSMContext):
+    await state.update_data(fio=message.text.strip())
+    await state.set_state(Form.birth)
+    await message.answer("Tug‘ilgan sana (kun.oy.yil)ni kiriting:")
+
+@dp.message(Form.birth)
+async def birth(message: Message, state: FSMContext):
+    await state.update_data(birth=message.text.strip())
+    await state.set_state(Form.birth_place)
+    await message.answer("Tug‘ilgan joyingizni kiriting:")
+
+@dp.message(Form.birth_place)
+async def birth_place(message: Message, state: FSMContext):
+    await state.update_data(birth_place=message.text.strip())
+    await state.set_state(Form.nationality)
+    await message.answer("Millatingizni kiriting:")
+
+@dp.message(Form.nationality)
+async def nationality(message: Message, state: FSMContext):
+    await state.update_data(nationality=message.text.strip())
+    await state.set_state(Form.party)
+    await message.answer("Partiyaviyligingizni kiriting yoki Yo'q bosing:", reply_markup=no_kb())
+
+@dp.message(Form.party)
+async def party(message: Message, state: FSMContext):
+    await state.update_data(party=message.text.strip())
+    await state.set_state(Form.education)
+    await message.answer("Ma’lumotingizni kiriting:")
+
+@dp.message(Form.education)
+async def education(message: Message, state: FSMContext):
+    await state.update_data(education=message.text.strip())
+    await state.set_state(Form.graduated)
+    await message.answer("Qaysi o‘quv yurtini qachon tamomlagansiz?")
+
+@dp.message(Form.graduated)
+async def graduated(message: Message, state: FSMContext):
+    await state.update_data(graduated=message.text.strip())
+    await state.set_state(Form.specialty)
+    await message.answer("Ma’lumotingiz bo‘yicha mutaxassisligingizni kiriting:")
+
+@dp.message(Form.specialty)
+async def specialty(message: Message, state: FSMContext):
+    await state.update_data(specialty=message.text.strip())
+    await state.set_state(Form.degree)
+    await message.answer("Ilmiy darajangizni kiriting yoki Yo'q bosing:")
+
+@dp.message(Form.degree)
+async def degree(message: Message, state: FSMContext):
+    await state.update_data(degree=message.text.strip())
+    await state.set_state(Form.languages)
+    await message.answer("Qaysi chet tillarini bilasiz? yoki Yo'q bosing:")
+
+@dp.message(Form.languages)
+async def languages(message: Message, state: FSMContext):
+    await state.update_data(languages=message.text.strip())
+    await state.set_state(Form.awards)
+    await message.answer("Davlat mukofotlari bilan taqdirlanganmisiz? Qaysi? yoki Yo'q:")
+
+@dp.message(Form.awards)
+async def awards(message: Message, state: FSMContext):
+    await state.update_data(awards=message.text.strip())
+    await state.set_state(Form.elected)
+    await message.answer("Saylanadigan organlarda deputat yoki a’zo bo‘lganmisiz? yoki Yo'q:")
+
+@dp.message(Form.elected)
+async def elected(message: Message, state: FSMContext):
+    await state.update_data(elected=message.text.strip(), work=[])
+    await state.set_state(Form.work)
+    await message.answer(
+        "Mehnat faoliyatingizni kiriting.\n"
+        "Har bir ish joyini alohida yuboring.\n"
+        "Tugatish uchun Yo'q bosing."
+    )
+
+@dp.message(Form.work)
+async def work(message: Message, state: FSMContext):
+    text = message.text.strip()
+    data = await state.get_data()
+    if is_no(text):
+        await state.set_state(Form.photo)
+        await message.answer("3x4 rasmingizni foto sifatida yuboring:")
+        return
+    arr = data.get("work", [])
+    arr.append(text)
+    await state.update_data(work=arr)
+    await message.answer("Keyingi ish joyini kiriting yoki Yo'q bosing.")
+
+@dp.message(Form.photo, F.photo)
+async def photo(message: Message, state: FSMContext):
+    f = await message.bot.get_file(message.photo[-1].file_id)
+    path = OUT / f"photo_{message.from_user.id}.jpg"
+    await message.bot.download_file(f.file_path, destination=path)
+    await state.update_data(photo=str(path), relatives=[])
+    await state.set_state(Form.relative)
+    await message.answer(
+        "Qarindosh ma’lumotlarini quyidagi ko‘rinishda yuboring:\n"
+        "Ota | F.I.Sh. | 1970-yil, joyi | Ish joyi va lavozimi | Turar joyi\n\n"
+        "Barcha qarindoshlarni kiritib bo‘lgach, pastdagi tugmani bosing.",
+        reply_markup=create_kb()
+    )
+
+@dp.message(Form.photo)
+async def photo_wrong(message: Message, state: FSMContext):
+    await message.answer("Iltimos, rasmni foto sifatida yuboring.")
+
+@dp.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "❌ Jarayon bekor qilindi. Qaytadan boshlash uchun /start bosing.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="OBYEKTIVKA YARATISH")]],
+            resize_keyboard=True
+        )
+    )
+
+
+@dp.message(F.text == "OBYEKTIVKA YARATISH")
+async def create_obyektivka(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    if not data or not data.get("fio") or not data.get("photo"):
+        await message.answer(
+            "⚠️ Ma’lumotlar to‘liq emas yoki sessiya tugagan.\n"
+            "Iltimos, /start bosib obyektivkani qaytadan to‘ldiring."
+        )
+        return
+
+    if not TEMPLATE.exists():
+        await message.answer(
+            "❌ Obyektivka shabloni (template.docx) serverda topilmadi."
+        )
+        print(f"TEMPLATE ERROR: {TEMPLATE}", flush=True)
+        return
+
+    if not ADMIN_ID:
+        await message.answer(
+            "❌ Qabul qiluvchi Telegram ID sozlanmagan. Administrator bilan bog‘laning."
+        )
+        print("ADMIN_ID ERROR: ADMIN_ID is empty/0", flush=True)
+        return
+
+    await message.answer("⏳ Obyektivka tayyorlanmoqda, biroz kuting...")
+
+    fio_parts = data["fio"].strip().split()
+    person_name = fio_parts[1] if len(fio_parts) >= 2 else fio_parts[0]
+    safe_name = "".join(
+        ch for ch in person_name
+        if ch.isalnum() or ch in "_'’-"
+    ).strip("._-")
+
+    if not safe_name:
+        safe_name = "FIO"
+
+    async with GENERATION_LOCK:
+        existing_numbers = []
+        for old_file in OUT.glob(f"Ma'lumotnoma_{safe_name}_*.docx"):
+            try:
+                existing_numbers.append(int(old_file.stem.rsplit("_", 1)[-1]))
+            except ValueError:
+                continue
+
+        next_number = max(existing_numbers, default=0) + 1
+        filename = OUT / f"Ma'lumotnoma_{safe_name}_{next_number:03d}.docx"
+
+        try:
+            # python-docx is synchronous, so do the heavy work outside the
+            # event loop.
+            await asyncio.to_thread(make_doc, data, filename)
+
+            username = (
+                f"@{message.from_user.username}"
+                if message.from_user and message.from_user.username
+                else "ko‘rsatilmagan"
+            )
+
+            caption = (
+                "📄 YANGI OBYEKTIVKA\n\n"
+                f"👤 F.I.O.: {data.get('fio', '')}\n"
+                f"🆔 Telegram ID: {message.from_user.id}\n"
+                f"👤 Username: {username}"
+            )
+
+            # IMPORTANT: send the document ONLY to the owner/admin.
+            await message.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=FSInputFile(filename),
+                caption=caption
+            )
+
+            await message.answer(
+                "✅ Obyektivka tayyorlandi. Fayl administratorga yuborildi.",
+                reply_markup=ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text="OBYEKTIVKA YARATISH")]],
+                    resize_keyboard=True
+                )
+            )
+
+            await state.clear()
+
+            # The photo is temporary; remove it after successful generation.
+            photo_path = data.get("photo")
+            if photo_path:
+                try:
+                    Path(photo_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        except Exception as e:
+            print(
+                f"CREATE/SEND DOCUMENT ERROR: {type(e).__name__}: {e}",
+                flush=True
+            )
+            await message.answer(
+                "❌ Obyektivka yaratish yoki administratorga yuborishda xatolik yuz berdi.\n"
+                "Iltimos, /start orqali qaytadan urinib ko‘ring."
+            )
+
+@dp.message(Form.relative, F.text)
+async def relative(message: Message, state: FSMContext):
+    text = message.text.strip()
+
+    if is_no(text):
+        await message.answer(
+            "⚠️ Qarindoshlar tugmasini bosing: obyektivkani tayyorlash uchun "
+            "pastdagi «OBYEKTIVKA YARATISH» tugmasidan foydalaning.",
+            reply_markup=create_kb()
+        )
+        return
+
+    parts = [x.strip() for x in text.split("|")]
+
+    if len(parts) != 5:
+        await message.answer(
+            "❌ Format xato. Aynan 5 ta qism bo‘lishi kerak:\n\n"
+            "Ota | F.I.Sh. | Tug‘ilgan yili va joyi | "
+            "Ish joyi va lavozimi | Turar joyi\n\n"
+            "Masalan:\n"
+            "Ota | Aliyev Ali Valiyevich | 1970-yil, Namangan | "
+            "Usta | Namangan viloyati"
+        )
+        return
+
+    if any(not part for part in parts):
+        await message.answer(
+            "❌ Qarindosh ma’lumotlarining bir qismi bo‘sh qolgan. "
+            "Barcha 5 qismni to‘ldiring. Ish joyi bo‘lmasa «-» yozishingiz mumkin."
+        )
+        return
+
+    data = await state.get_data()
+    relatives = data.get("relatives", [])
+    relatives.append(parts)
+    await state.update_data(relatives=relatives)
+
+    await message.answer(
+        f"✅ Qabul qilindi. Qarindoshlar soni: {len(relatives)}\n"
+        "Keyingi qarindoshni kiriting yoki pastdagi tugmani bosing.",
+        reply_markup=create_kb()
+    )
+
+async def health(request):
+    return web.Response(text="OK")
+
+async def telegram_webhook(request):
+    try:
+        data = await request.json()
+        update = Update.model_validate(data)
+        await dp.feed_update(request.app["bot"], update)
+        return web.Response(text="OK")
+    except Exception as e:
+        print(
+            f"Webhook error: {type(e).__name__}: {e}",
+            flush=True
+        )
+        return web.Response(status=500, text="Webhook error")
+
+async def on_startup(app):
+    bot = app["bot"]
+
+    if not TEMPLATE.exists():
+        raise RuntimeError(f"template.docx topilmadi: {TEMPLATE}")
+
+    if not ADMIN_ID:
+        raise RuntimeError("ADMIN_ID sozlanmagan.")
+
+    # Make sure the owner/admin chat is reachable. This also catches a
+    # wrong ADMIN_ID early in the Render logs.
+    try:
+        admin_user = await bot.get_chat(ADMIN_ID)
+        print(
+            f"Admin chat OK: {admin_user.id} / "
+            f"@{getattr(admin_user, 'username', None)}",
+            flush=True
+        )
+    except Exception as e:
+        print(
+            f"WARNING: ADMIN_ID={ADMIN_ID} bilan chatni tekshirishda xatolik: "
+            f"{type(e).__name__}: {e}",
+            flush=True
+        )
+
+    external_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("EXTERNAL_URL")
+    if not external_url:
+        raise RuntimeError("RENDER_EXTERNAL_URL topilmadi.")
+    webhook_url = external_url.rstrip("/") + "/telegram/webhook"
+    await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    print(f"Telegram webhook set: {webhook_url}")
+
+async def on_cleanup(app):
+    bot = app["bot"]
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    finally:
+        await bot.session.close()
+
+async def main():
+    bot = Bot(BOT_TOKEN)
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_post("/telegram/webhook", telegram_webhook)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    port = int(os.environ.get("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Web service listening on port {port}")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
